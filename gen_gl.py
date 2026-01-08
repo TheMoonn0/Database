@@ -113,21 +113,37 @@ def make_unique_sheet_name(book, desired_name: str):
         i += 1
     return name
 
+def max_k_from_searchkey(series: pd.Series) -> int:
+    """
+    หา max เลขท้ายของรูปแบบ xxxx|k จากคอลัมน์ _SearchKey
+    ถ้าไม่เจอคืน 1
+    """
+    max_k = 1
+    try:
+        k_series = series.astype(str).str.extract(r"\|(\d+)\s*$")[0]
+        k_series = pd.to_numeric(k_series, errors="coerce")
+        max_k_val = k_series.max()
+        if pd.notna(max_k_val):
+            max_k = int(max_k_val)
+    except:
+        max_k = 1
+    return max_k
+
 # =========================
 # Config
 # =========================
-tlf_reserved_rows = 2
-gl_reserved_rows = 10
+tlf_reserved_rows = 2   # ขั้นต่ำ (แต่จะขยายตาม max "|k")
+gl_reserved_rows = 10   # ขั้นต่ำ (แต่จะขยายตาม max "|k")
 gap_rows = 3
 exclude_tlf_columns = ["from_acct", "to_acct", "auth_branch_from"]
 
-# ✅ เปลี่ยน label ให้สอดคล้องกับการเรียก Database
 TLF_LABEL = "Database(ATMI)"
 
-# GL columns (from file)
+# GL columns (from file): J K L M N P AM AN AZ
 gl_columns_letters = ["J", "K", "L", "M", "N", "P", "AM", "AN", "AZ"]
-gl_base_headers = ["RC", "OC", "CH", "Product Code", "Account Code", "Tax", "DR", "CR", "Seq"]
-gl_new_headers = gl_base_headers + ["Details"]  # add Details
+
+# ✅ โครงสร้างคอลัมน์ “สุดท้าย” ของตาราง ATMI (เหมือน GL_V4)
+gl_final_headers = ["RC", "OC", "CH", "Product Code", "Account Code", "Tax", "DR", "CR", "Seq", "Details"]
 
 # TLF columns
 tlf_columns_letters = [
@@ -166,11 +182,11 @@ search_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="s
 # =========================
 # Core Processing (In-Memory)
 # =========================
-def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: str):
+def process_data_in_memory(db_path: str, source_files_list: list, temp_folder: str):
     output = io.BytesIO()
 
     try:
-        with pd.ExcelFile(tlf_path) as tlf_book:
+        with pd.ExcelFile(db_path) as db_book:
             files_to_process = pick_latest_files_by_duplicate_d_date(temp_folder, source_files_list)
             if not files_to_process:
                 return None, "ไม่พบไฟล์ข้อมูล (GL/TRF/CSV/TXT/Excel) ที่ถูกต้องใน ZIP"
@@ -181,58 +197,62 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                     filename = os.path.basename(file_path)
                     chosen_d_date = item["d_date"]
 
-                    # Sheet name = D-date (no 'D') or filename
                     desired_sheet_name = chosen_d_date if chosen_d_date else os.path.splitext(filename)[0]
 
-                    # Fallback lookup name
                     clean_name = re.sub(r"GL", "", filename, flags=re.IGNORECASE)
                     clean_name = os.path.splitext(clean_name)[0].strip()
                     fallback_lookup_name = strip_d_suffix_for_tlf_sheet(clean_name)
 
-                    # Lookup priority: D-date / D+D-date / fallback
-                    tlf_lookup_candidates = []
+                    db_lookup_candidates = []
                     if chosen_d_date:
-                        tlf_lookup_candidates.append(chosen_d_date)
-                        tlf_lookup_candidates.append("D" + chosen_d_date)
-                    tlf_lookup_candidates.append(fallback_lookup_name)
+                        db_lookup_candidates.append(chosen_d_date)
+                        db_lookup_candidates.append("D" + chosen_d_date)
+                    db_lookup_candidates.append(fallback_lookup_name)
 
-                    tlf_sheet_to_use = None
-                    for cand in tlf_lookup_candidates:
-                        if cand and cand in tlf_book.sheet_names:
-                            tlf_sheet_to_use = cand
+                    db_sheet_to_use = None
+                    for cand in db_lookup_candidates:
+                        if cand and cand in db_book.sheet_names:
+                            db_sheet_to_use = cand
                             break
 
                     try:
                         # ---------- Load Database ----------
-                        tlf_df = pd.DataFrame()
-                        if tlf_sheet_to_use:
-                            tlf_df = pd.read_excel(
-                                tlf_book,
-                                sheet_name=tlf_sheet_to_use,
+                        db_df = pd.DataFrame()
+                        effective_db_reserved_rows = tlf_reserved_rows
+                        max_k_db = 1
+
+                        if db_sheet_to_use:
+                            db_df = pd.read_excel(
+                                db_book,
+                                sheet_name=db_sheet_to_use,
                                 usecols=tlf_indices,
                                 dtype=str,
                             )
-                            for col in tlf_df.columns:
-                                tlf_df[col] = tlf_df[col].astype(str).str.strip()
+                            for col in db_df.columns:
+                                db_df[col] = db_df[col].astype(str).str.strip()
 
                             # implied decimal (only when startswith "00")
-                            if pos_AZ != -1 and pos_AZ < len(tlf_df.columns):
-                                tlf_df.iloc[:, pos_AZ] = tlf_df.iloc[:, pos_AZ].apply(convert_implied_decimal)
-                            if pos_CU != -1 and pos_CU < len(tlf_df.columns):
-                                tlf_df.iloc[:, pos_CU] = tlf_df.iloc[:, pos_CU].apply(convert_implied_decimal)
+                            if pos_AZ != -1 and pos_AZ < len(db_df.columns):
+                                db_df.iloc[:, pos_AZ] = db_df.iloc[:, pos_AZ].apply(convert_implied_decimal)
+                            if pos_CU != -1 and pos_CU < len(db_df.columns):
+                                db_df.iloc[:, pos_CU] = db_df.iloc[:, pos_CU].apply(convert_implied_decimal)
 
-                            # build search key
-                            if not tlf_df.empty and len(tlf_df.columns) > 8:
-                                search_col = tlf_df.iloc[:, 8].astype(str).str.strip()
-                                tlf_df["_SearchKey"] = search_col + "|" + (tlf_df.groupby(search_col).cumcount() + 1).astype(str)
+                            # _SearchKey
+                            if not db_df.empty and len(db_df.columns) > 8:
+                                search_col = db_df.iloc[:, 8].astype(str).str.strip()
+                                db_df["_SearchKey"] = search_col + "|" + (db_df.groupby(search_col).cumcount() + 1).astype(str)
 
-                        # ---------- Load Source (GL/TRF/CSV/TXT/Excel) ----------
+                                # ✅ ขยาย UI rows ตาม max|k (เหมือน GL_V4)
+                                max_k_db = max_k_from_searchkey(db_df["_SearchKey"])
+                                effective_db_reserved_rows = max(tlf_reserved_rows, max_k_db)
+
+                        # ---------- Load Source (ATMI / GL) ----------
                         if filename.lower().endswith((".xls", ".xlsx")):
                             with pd.ExcelFile(file_path) as source_book:
-                                gl_df = pd.read_excel(source_book, header=None, usecols=gl_indices, dtype=str)
+                                raw_gl = pd.read_excel(source_book, header=None, usecols=gl_indices, dtype=str)
                         else:
                             try:
-                                gl_df = pd.read_csv(
+                                raw_gl = pd.read_csv(
                                     file_path,
                                     header=None,
                                     usecols=gl_indices,
@@ -241,7 +261,7 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                                     engine="python",
                                 )
                             except:
-                                gl_df = pd.read_csv(
+                                raw_gl = pd.read_csv(
                                     file_path,
                                     header=None,
                                     usecols=gl_indices,
@@ -250,17 +270,22 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                                     engine="python",
                                 )
 
-                        # Set headers for 9 cols
-                        if len(gl_df.columns) == len(gl_base_headers):
-                            gl_df.columns = gl_base_headers
+                        # ✅ เหมือน GL_V4: ตั้งชื่อ source headers แล้วสร้าง Details/Seq จาก AZ_RAW
+                        gl_source_headers = ["RC", "OC", "CH", "Product Code", "Account Code", "Tax", "DR", "CR", "AZ_RAW"]
+                        if len(raw_gl.columns) == len(gl_source_headers):
+                            raw_gl.columns = gl_source_headers
+                        else:
+                            # หากจำนวนคอลัมน์ไม่ตรง ให้พยายามตั้งชื่อเท่าที่ทำได้
+                            raw_gl.columns = gl_source_headers[: len(raw_gl.columns)]
 
-                        # Details = raw Seq before extract
-                        if "Seq" in gl_df.columns:
-                            gl_df["Details"] = gl_df["Seq"]
+                        gl_df = raw_gl.copy()
+                        if "AZ_RAW" in gl_df.columns:
+                            gl_df["Details"] = gl_df["AZ_RAW"]
+                            gl_df["Seq"] = gl_df["AZ_RAW"].apply(extract_seq_num).astype(str).str.strip()
                         else:
                             gl_df["Details"] = ""
+                            gl_df["Seq"] = ""
 
-                        # Clean / types
                         if "RC" in gl_df.columns:
                             gl_df["RC"] = gl_df["RC"].astype(str).str.strip()
                         if "CH" in gl_df.columns:
@@ -271,9 +296,11 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                         if "CR" in gl_df.columns:
                             gl_df["CR"] = pd.to_numeric(gl_df["CR"], errors="coerce").fillna(0)
 
-                        # Extract Seq
-                        if "Seq" in gl_df.columns:
-                            gl_df["Seq"] = gl_df["Seq"].apply(extract_seq_num).astype(str).str.strip()
+                        # ✅ คงลำดับคอลัมน์แบบ GL_V4
+                        for col in gl_final_headers:
+                            if col not in gl_df.columns:
+                                gl_df[col] = ""
+                        gl_df = gl_df[gl_final_headers]
 
                         # Sort
                         cols_to_sort = ["CH", "RC", "OC", "Product Code"]
@@ -281,10 +308,16 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                         if valid_sort_cols:
                             gl_df = gl_df.sort_values(by=valid_sort_cols, ascending=[True] * len(valid_sort_cols))
 
-                        # Search key for GL
-                        if (not gl_df.empty) and ("Seq" in gl_df.columns):
+                        # _SearchKey (GL)
+                        effective_gl_reserved_rows = gl_reserved_rows
+                        max_k_gl = 1
+                        if not gl_df.empty:
                             search_col_gl = gl_df["Seq"].astype(str)
                             gl_df["_SearchKey"] = search_col_gl + "|" + (gl_df.groupby(search_col_gl).cumcount() + 1).astype(str)
+
+                            # ✅ ขยาย UI rows ตาม max|k (เหมือน GL_V4)
+                            max_k_gl = max_k_from_searchkey(gl_df["_SearchKey"])
+                            effective_gl_reserved_rows = max(gl_reserved_rows, max_k_gl)
 
                         # ---------- Write Layout ----------
                         target_sheet_name = make_unique_sheet_name(writer.book, desired_sheet_name)
@@ -293,29 +326,29 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                         ws = writer.sheets[target_sheet_name]
 
                         search_ui_start_row = 1
-                        tlf_ui_height = 2 + tlf_reserved_rows
-                        gl_ui_height = 2 + gl_reserved_rows
-                        raw_data_start_row = search_ui_start_row + tlf_ui_height + gap_rows + gl_ui_height + 5
+                        db_ui_height = 2 + (effective_db_reserved_rows if not db_df.empty else 0)
+                        gl_ui_height = 2 + (effective_gl_reserved_rows if not gl_df.empty else 0)
+                        raw_data_start_row = search_ui_start_row + db_ui_height + gap_rows + gl_ui_height + 5
 
                         current_raw_row = raw_data_start_row
 
                         # ranges
-                        tlf_data_start = tlf_data_end = None
-                        tlf_key_col_letter = "A"
+                        db_data_start = db_data_end = None
+                        db_key_col_letter = "A"
                         gl_data_start = gl_data_end = None
                         gl_key_col_letter = "A"
 
                         # --- Raw Database ---
-                        if not tlf_df.empty:
+                        if not db_df.empty:
                             ws.cell(row=current_raw_row - 1, column=1, value=TLF_LABEL).font = Font(bold=True, italic=True)
-                            tlf_df.to_excel(writer, sheet_name=target_sheet_name, startrow=current_raw_row - 1, index=False)
+                            db_df.to_excel(writer, sheet_name=target_sheet_name, startrow=current_raw_row - 1, index=False)
 
-                            tlf_data_start = current_raw_row + 1
-                            tlf_data_end = current_raw_row + len(tlf_df)
-                            tlf_key_col_letter = get_column_letter(len(tlf_df.columns))
+                            db_data_start = current_raw_row + 1
+                            db_data_end = current_raw_row + len(db_df)
+                            db_key_col_letter = get_column_letter(len(db_df.columns))
 
-                            for row in range(current_raw_row, tlf_data_end + 1):
-                                for col in range(1, len(tlf_df.columns)):
+                            for row in range(current_raw_row, db_data_end + 1):
+                                for col in range(1, len(db_df.columns)):
                                     cell = ws.cell(row=row, column=col)
                                     cell.border = thin_border
                                     if row == current_raw_row:
@@ -325,17 +358,18 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                                         cell.alignment = align_right if isinstance(cell.value, (int, float)) else align_center
                                         if col == 9:
                                             cell.number_format = "@"
-                            current_raw_row += len(tlf_df) + 4
+                            current_raw_row += len(db_df) + 4
 
-                        # --- Raw GL ---
+                        # --- Raw ATMI ---
                         if not gl_df.empty:
                             ws.cell(row=current_raw_row - 1, column=1, value="--- Raw ATMI Data ---").font = Font(bold=True, italic=True)
                             gl_df.to_excel(writer, sheet_name=target_sheet_name, startrow=current_raw_row - 1, index=False)
 
                             gl_data_start = current_raw_row + 1
                             gl_data_end = current_raw_row + len(gl_df)
-                            gl_key_col_letter = get_column_letter(len(gl_df.columns))
+                            gl_key_col_letter = get_column_letter(len(gl_df.columns))  # includes _SearchKey too (because exported)
 
+                            # Styling
                             for row in range(current_raw_row, gl_data_end + 1):
                                 for col in range(1, len(gl_df.columns) + 1):
                                     cell = ws.cell(row=row, column=col)
@@ -353,7 +387,6 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                                             cell.number_format = "@"
                                         else:
                                             cell.alignment = align_center
-
                                         if col_name in ["Seq", "Details"]:
                                             cell.number_format = "@"
 
@@ -372,11 +405,11 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                         report_row = search_ui_start_row + 2
 
                         # --- Database Report ---
-                        if not tlf_df.empty:
+                        if not db_df.empty:
                             ws[f"A{report_row}"] = TLF_LABEL
                             ws[f"A{report_row}"].font = title_font
 
-                            display_cols = [c for c in tlf_df.columns if c != "_SearchKey" and c not in exclude_tlf_columns]
+                            display_cols = [c for c in db_df.columns if c != "_SearchKey" and c not in exclude_tlf_columns]
 
                             # swap (as original)
                             if "amt_1_full" in display_cols and "resp_byte" in display_cols:
@@ -384,7 +417,7 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                                 idx2 = display_cols.index("resp_byte")
                                 display_cols[idx1], display_cols[idx2] = display_cols[idx2], display_cols[idx1]
 
-                            tlf_key_range_str = f"${tlf_key_col_letter}${tlf_data_start}:${tlf_key_col_letter}${tlf_data_end}"
+                            db_key_range_str = f"${db_key_col_letter}${db_data_start}:${db_key_col_letter}${db_data_end}"
 
                             for i, col_name in enumerate(display_cols, 1):
                                 cell = ws.cell(row=report_row + 1, column=i)
@@ -395,15 +428,17 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                                 cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
 
                             data_start_row = report_row + 2
-                            for r_offset in range(tlf_reserved_rows):
+
+                            # ✅ ใช้ effective_db_reserved_rows (ตาม max|k)
+                            for r_offset in range(effective_db_reserved_rows):
                                 current_formula_row = data_start_row + r_offset
                                 k_value = r_offset + 1
-                                match_logic = f'MATCH({input_cell_ref}&"|"&{k_value}, {tlf_key_range_str}, 0)'
+                                match_logic = f'MATCH({input_cell_ref}&"|"&{k_value}, {db_key_range_str}, 0)'
 
                                 for i, col_name in enumerate(display_cols, 1):
-                                    original_col_idx = tlf_df.columns.get_loc(col_name)
+                                    original_col_idx = db_df.columns.get_loc(col_name)
                                     col_letter = get_column_letter(original_col_idx + 1)
-                                    data_col_range = f"${col_letter}${tlf_data_start}:${col_letter}${tlf_data_end}"
+                                    data_col_range = f"${col_letter}${db_data_start}:${col_letter}${db_data_end}"
                                     formula = f'=IFERROR(INDEX({data_col_range}, {match_logic}), "")'
 
                                     cell = ws.cell(row=current_formula_row, column=i)
@@ -411,11 +446,11 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                                     cell.border = thin_border
                                     cell.alignment = align_center
 
-                            report_row = data_start_row + tlf_reserved_rows
+                            report_row = data_start_row + effective_db_reserved_rows
 
                         report_row += gap_rows
 
-                        # --- GL Report ---
+                        # --- ATMI Report ---
                         if not gl_df.empty:
                             ws[f"A{report_row}"] = "ATMI"
                             ws[f"A{report_row}"].font = title_font
@@ -431,9 +466,15 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                                 cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
 
                             data_start_row = report_row + 2
-                            gl_key_range_str = f"${gl_key_col_letter}${gl_data_start}:${gl_key_col_letter}${gl_data_end}"
 
-                            for r_offset in range(gl_reserved_rows):
+                            # IMPORTANT: raw table includes _SearchKey col; key is last col
+                            # For matching, we need range of _SearchKey column specifically.
+                            # Find where _SearchKey was written in excel: it's the last column in exported gl_df.
+                            gl_key_col_excel = get_column_letter(len(gl_df.columns))
+                            gl_key_range_str = f"${gl_key_col_excel}${gl_data_start}:${gl_key_col_excel}${gl_data_end}"
+
+                            # ✅ ใช้ effective_gl_reserved_rows (ตาม max|k)
+                            for r_offset in range(effective_gl_reserved_rows):
                                 current_formula_row = data_start_row + r_offset
                                 k_value = r_offset + 1
                                 match_logic = f'MATCH({input_cell_ref}&"|"&{k_value}, {gl_key_range_str}, 0)'
@@ -479,10 +520,11 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                                 existing = col_widths.get(current_idx, 0)
                                 col_widths[current_idx] = max(existing, max_len + 3)
 
-                        if not tlf_df.empty:
-                            update_max_width(tlf_df, start_col_idx=1)
+                        if not db_df.empty:
+                            update_max_width(db_df, start_col_idx=1)
 
                         if not gl_df.empty:
+                            # skip Details to lock width later
                             update_max_width(gl_df, start_col_idx=1, skip_cols={"Details"})
 
                         for col_idx, width in col_widths.items():
@@ -490,6 +532,7 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                             final_width = max(12, min(width, 60))
                             writer.sheets[target_sheet_name].column_dimensions[col_letter].width = final_width
 
+                        # widen A,B
                         writer.sheets[target_sheet_name].column_dimensions["A"].width = max(col_widths.get(1, 20), 30)
                         writer.sheets[target_sheet_name].column_dimensions["B"].width = max(col_widths.get(2, 20), 25)
 
@@ -500,6 +543,7 @@ def process_data_in_memory(tlf_path: str, source_files_list: list, temp_folder: 
                             writer.sheets[target_sheet_name].column_dimensions[details_col_letter].width = 12
 
                     except Exception:
+                        # continue next file
                         pass
 
                 if "Sheet" in writer.book.sheetnames and len(writer.book.sheetnames) > 1:
@@ -532,7 +576,7 @@ if uploaded_zip:
                         zip_ref.extractall(temp_dir)
 
                     # Identify files
-                    tlf_path = None
+                    db_path = None
                     source_files = []
 
                     for root, _, files in os.walk(temp_dir):
@@ -542,22 +586,22 @@ if uploaded_zip:
 
                             full_path = os.path.join(root, file)
 
-                            # ✅ เปลี่ยนจาก "TLF" เป็น "Database"
+                            # ✅ จับไฟล์ชื่อ Database
                             if "DATABASE" in file.upper():
-                                if tlf_path is None:
-                                    tlf_path = full_path
+                                if db_path is None:
+                                    db_path = full_path
                             else:
                                 source_files.append(os.path.relpath(full_path, temp_dir))
 
-                    if not tlf_path:
+                    if not db_path:
                         st.error("❌ ไม่พบไฟล์ Database ใน ZIP (ต้องมีคำว่า 'Database' ในชื่อไฟล์)")
                     elif not source_files:
                         st.error("❌ ไม่พบไฟล์ข้อมูล Source ใน ZIP")
                     else:
-                        st.info(f"📍 Found Database: {os.path.basename(tlf_path)}")
+                        st.info(f"📍 Found Database: {os.path.basename(db_path)}")
                         st.info(f"📍 Found Source Files: {len(source_files)} files")
 
-                        excel_file, error_msg = process_data_in_memory(tlf_path, source_files, temp_dir)
+                        excel_file, error_msg = process_data_in_memory(db_path, source_files, temp_dir)
 
                         if error_msg:
                             st.error(error_msg)
